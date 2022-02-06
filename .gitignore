@@ -27,3 +27,5 @@
 *.exe
 *.gz
 *.swp
+/pgbouncer.ini
+/userlist.txt
