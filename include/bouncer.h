@@ -27,6 +27,7 @@
 #include <usual/list.h>
 #include <usual/statlist.h>
 #include <usual/aatree.h>
+#include <usual/socket.h>
 
 #include <event2/event.h>
 #include <event2/event_struct.h>
@@ -139,11 +140,9 @@ extern int cf_sbuf_len;
 
 /*
  * Some cloud services use very long generated passwords, so give it
- * plenty of room.  Up to PostgreSQL 13, the server can handle
- * passwords up to 996 bytes, after that it's longer.  Also, libpq
- * maxes out around 1024, so going much higher is not straightforward.
+ * plenty of room.
  */
-#define MAX_PASSWORD	996
+#define MAX_PASSWORD	2048
 
 /*
  * AUTH_* symbols are used for both protocol handling and
@@ -288,6 +287,8 @@ struct PgPool {
 	bool last_login_failed:1;
 
 	bool welcome_msg_ready:1;
+
+	int16_t rrcounter;		/* round-robin counter */
 };
 
 #define pool_connected_server_count(pool) ( \
@@ -363,6 +364,7 @@ struct PgDatabase {
 	bool db_auto;		/* is the database auto-created by autodb_connstr */
 	bool db_disabled;	/* is the database accepting new connections? */
 	bool admin;		/* internal console db */
+	bool fake;		/* not a real database, only for mock auth */
 	usec_t inactive_time;	/* when auto-database became inactive (to kill it after timeout) */
 	unsigned active_stamp;	/* set if autodb has connections */
 	int connection_count;	/* total connections for this database in all pools */
@@ -588,7 +590,6 @@ last_socket(struct StatList *slist)
 	return container_of(slist->head.prev, PgSocket, head);
 }
 
-bool requires_auth_file(int);
 void load_config(void);
 
 

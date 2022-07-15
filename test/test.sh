@@ -52,7 +52,6 @@ case `uname` in
 		;;
 esac
 
-# System configuration checks
 SED_ERE_OP='-E'
 case `uname` in
 Linux)
@@ -79,14 +78,18 @@ if ! $use_unix_sockets; then
 	BOUNCER_ADMIN_HOST=127.0.0.1
 
 	cp test.ini test.ini.bak
-	sed -i 's/^unix_socket_dir =/#&/' test.ini
+	echo "unix_socket_dir = ''" >> test.ini
 	echo 'admin_users = pgbouncer' >> test.ini
 fi
 
 MAX_PASSWORD=$(sed -n $SED_ERE_OP 's/#define MAX_PASSWORD[[:space:]]+([0-9]+)/\1/p' ../include/bouncer.h)
+# Up to PostgreSQL 13, the server can handle passwords up to 996 bytes
+# (including zero byte), after that it's longer.
+if test $pg_majorversion -lt 14 -a $MAX_PASSWORD -gt 996; then
+	MAX_PASSWORD=996
+fi
 long_password=$(printf '%*s' $(($MAX_PASSWORD - 1)) | tr ' ' 'a')
 
-# System configuration checks
 if ! grep -q "^\"${USER:=$(id -un)}\"" userlist.txt; then
 	cp userlist.txt userlist.txt.bak
 	echo "\"${USER}\" \"01234\"" >> userlist.txt
@@ -128,16 +131,26 @@ rm -rf $PGDATA
 
 if [ ! -d $PGDATA ]; then
 	mkdir $PGDATA
-	initdb --nosync >> $PG_LOG 2>&1
+	initdb -A trust --nosync >> $PG_LOG
 	if $use_unix_sockets; then
-		sed $SED_ERE_OP -i "/unix_socket_director/s:.*(unix_socket_director.*=).*:\\1 '/tmp':" pgdata/postgresql.conf
+		echo "unix_socket_directories = '/tmp'" >> pgdata/postgresql.conf
 	fi
+	# We need to make the log go to stderr so that the tests can
+	# check what is being logged.  This should be the default, but
+	# some packagings change the default configuration.
 	cat >>pgdata/postgresql.conf <<-EOF
+	logging_collector = off
+	log_destination = stderr
 	log_connections = on
 	EOF
+	if $use_unix_sockets; then
+		local='local'
+	else
+		local='#local'
+	fi
 	if $pg_supports_scram; then
 		cat >pgdata/pg_hba.conf <<-EOF
-		local  p6   all                scram-sha-256
+		$local  p6   all                scram-sha-256
 		host   p6   all  127.0.0.1/32  scram-sha-256
 		host   p6   all  ::1/128       scram-sha-256
 		EOF
@@ -145,19 +158,16 @@ if [ ! -d $PGDATA ]; then
 		cat >pgdata/pg_hba.conf </dev/null
 	fi
 	cat >>pgdata/pg_hba.conf <<-EOF
-	local  p4   all                password
+	$local  p4   all                password
 	host   p4   all  127.0.0.1/32  password
 	host   p4   all  ::1/128       password
-	local  p5   all                md5
+	$local  p5   all                md5
 	host   p5   all  127.0.0.1/32  md5
 	host   p5   all  ::1/128       md5
-	local  all  all                trust
+	$local  all  all                trust
 	host   all  all  127.0.0.1/32  trust
 	host   all  all  ::1/128       trust
 	EOF
-	if ! $use_unix_sockets; then
-		sed -i 's/^local/#local/' pgdata/pg_hba.conf
-	fi
 fi
 
 pgctl start
@@ -338,6 +348,10 @@ test_show_version() {
 	echo "v2=$v2"
 
 	test x"$v1" = x"$v2"
+}
+
+test_help() {
+	$BOUNCER_EXE --help || return 1
 }
 
 # test all the show commands
@@ -1211,8 +1225,49 @@ test_no_user_auth_user() {
 }
 
 test_auto_database() {
-	psql -X -d p7 -c "select current_database()" || return 1
-	grep -F "registered new auto-database" $BOUNCER_LOG || return 1
+	cp test.ini test.ini.bak
+	sed 's/^;\*/*/g' test.ini >test2.ini
+	mv test2.ini test.ini
+
+	admin "reload"
+
+	psql -X -d p7 -c "select current_database()"
+	status1=$?
+	grep -F "registered new auto-database" $BOUNCER_LOG
+	status2=$?
+
+	cp test.ini.bak test.ini
+	rm test.ini.bak
+
+	test $status1 -eq 0 -a $status2 -eq 0
+}
+
+test_no_database() {
+	psql -X -d nosuchdb1 -c "select 1" && return 1
+	grep -F "no such database: nosuchdb1" $BOUNCER_LOG || return 1
+
+	return 0
+}
+
+test_no_database_authfail() {
+	$have_getpeereid || return 77
+
+	admin "set auth_type='md5'"
+
+	PGPASSWORD=wrong psql -X -d nosuchdb1 -c "select 1" && return 1
+	grep -F "closing because: password authentication failed" $BOUNCER_LOG || return 1
+
+	return 0
+}
+
+test_no_database_auth_user() {
+	$have_getpeereid || return 77
+
+	admin "set auth_type='md5'"
+	admin "set auth_user='pswcheck'"
+
+	PGPASSWORD=wrong psql -X -d nosuchdb1 -U someuser -c "select 1" && return 1
+	grep "closing because: password authentication failed" $BOUNCER_LOG || return 1
 
 	return 0
 }
@@ -1302,8 +1357,42 @@ test_cancel_pool_size() {
 	return 0
 }
 
+# This test checks database specifications with host lists.  The way
+# we test this here is to have a host list containing an IPv4 and an
+# IPv6 representation of localhost, and then we check the log that
+# both connections were made.  Some CI environments don't have IPv6
+# localhost configured.  Therefore, this test is skipped by default
+# and needs to be enabled explicitly by setting HAVE_IPV6_LOCALHOST to
+# non-empty.
+test_host_list() {
+	test -z "$HAVE_IPV6_LOCALHOST" && return 77
+
+	psql -X -d hostlist1 -c 'select pg_sleep(1)' >/dev/null &
+	psql -X -d hostlist1 -c 'select 1'
+	psql -X -d hostlist1 -c 'select 2'
+
+	grep -F 'hostlist1/bouncer@127.0.0.1:6666 new connection to server' $BOUNCER_LOG || return 1
+	grep -F 'hostlist1/bouncer@[::1]:6666 new connection to server' $BOUNCER_LOG || return 1
+	return 0
+}
+
+# This is the same test as above, except it doesn't use any IPv6
+# addresses.  So we can't actually tell apart that two separate
+# connections are made.  But the test is useful to get some test
+# coverage (valgrind etc.) of the host list code on systems without
+# IPv6 enabled.
+test_host_list_dummy() {
+	psql -X -d hostlist2 -c 'select pg_sleep(1)' >/dev/null &
+	psql -X -d hostlist2 -c 'select 1'
+	psql -X -d hostlist2 -c 'select 2'
+
+	grep -F 'hostlist2/bouncer@127.0.0.1:6666 new connection to server' $BOUNCER_LOG || return 1
+	return 0
+}
+
 testlist="
 test_show_version
+test_help
 test_show
 test_server_login_retry
 test_auth_user
@@ -1350,9 +1439,14 @@ test_no_user_scram
 test_no_user_scram_forced_user
 test_no_user_auth_user
 test_auto_database
+test_no_database
+test_no_database_authfail
+test_no_database_auth_user
 test_cancel
 test_cancel_wait
 test_cancel_pool_size
+test_host_list
+test_host_list_dummy
 "
 
 if [ $# -gt 0 ]; then

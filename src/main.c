@@ -31,6 +31,10 @@
 #include <usual/socket.h>
 #include <usual/string.h>
 
+#ifdef WIN32
+#include "win32support.h"
+#endif
+
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
 #endif
@@ -93,10 +97,11 @@ int cf_sbuf_len;
 int cf_sbuf_loopcnt;
 int cf_so_reuseport;
 int cf_tcp_socket_buffer;
-#if defined(TCP_DEFER_ACCEPT) || defined(SO_ACCEPTFILTER)
-int cf_tcp_defer_accept = 1;
+int cf_tcp_defer_accept;
+#if defined(TCP_DEFER_ACCEPT)
+#define DEFAULT_TCP_DEFER_ACCEPT "1"
 #else
-int cf_tcp_defer_accept = 0;
+#define DEFAULT_TCP_DEFER_ACCEPT "0"
 #endif
 int cf_tcp_keepalive;
 int cf_tcp_keepcnt;
@@ -296,7 +301,7 @@ CF_ABS("suspend_timeout", CF_TIME_USEC, cf_suspend_timeout, 0, "10"),
 CF_ABS("syslog", CF_INT, cf_syslog, 0, "0"),
 CF_ABS("syslog_facility", CF_STR, cf_syslog_facility, 0, "daemon"),
 CF_ABS("syslog_ident", CF_STR, cf_syslog_ident, 0, "pgbouncer"),
-CF_ABS("tcp_defer_accept", DEFER_OPS, cf_tcp_defer_accept, 0, NULL),
+CF_ABS("tcp_defer_accept", DEFER_OPS, cf_tcp_defer_accept, 0, DEFAULT_TCP_DEFER_ACCEPT),
 CF_ABS("tcp_keepalive", CF_INT, cf_tcp_keepalive, 0, "1"),
 CF_ABS("tcp_keepcnt", CF_INT, cf_tcp_keepcnt, 0, "0"),
 CF_ABS("tcp_keepidle", CF_INT, cf_tcp_keepidle, 0, "0"),
@@ -381,7 +386,7 @@ static void set_dbs_dead(bool flag)
 }
 
 /* Tells if the specified auth type requires data from the auth file. */
-bool requires_auth_file(int auth_type)
+static bool requires_auth_file(int auth_type)
 {
 	/* For PAM authentication auth file is not used */
 	if (auth_type == AUTH_PAM)
@@ -919,6 +924,16 @@ int main(int argc, char *argv[])
 	}
 	cf_config_file = xstrdup(argv[optind]);
 
+#ifdef CASSERT
+	/*
+	 * Clean up all objects at the end, only for testing the
+	 * cleanup code, not useful for production.  This must be the
+	 * first atexit() call, since other atexit() handlers still
+	 * make use of things that will be cleaned up.
+	 */
+	atexit(cleanup);
+#endif
+
 	init_objects();
 	load_config();
 	main_config.loaded = true;
@@ -999,11 +1014,6 @@ int main(int argc, char *argv[])
 	/* main loop */
 	while (cf_shutdown < 2)
 		main_loop_once();
-
-	/* not useful for production loads */
-#ifdef CASSERT
-	cleanup();
-#endif
 
 	return 0;
 }

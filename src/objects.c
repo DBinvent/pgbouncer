@@ -23,6 +23,7 @@
 #include "bouncer.h"
 #include "scram.h"
 
+#include <usual/err.h>
 #include <usual/safeio.h>
 #include <usual/slab.h>
 
@@ -601,7 +602,7 @@ bool check_fast_fail(PgSocket *client)
 		return true;
 
 	/* Else we fail the client. */
-	disconnect_client(client, true, "pgbouncer cannot connect to server");
+	disconnect_client(client, true, "server login has been failing, try again later (server_login_retry)");
 
 	/*
 	 * Try to launch a new connection.  (launch_new_connection()
@@ -718,7 +719,7 @@ static bool reset_on_release(PgSocket *server)
 	return res;
 }
 
-static bool life_over(PgSocket *server)
+bool life_over(PgSocket *server)
 {
 	PgPool *pool = server->pool;
 	usec_t lifetime_kill_gap = 0;
@@ -729,6 +730,11 @@ static bool life_over(PgSocket *server)
 	if (age < cf_server_lifetime)
 		return false;
 
+	/*
+	 * Calculate the time that disconnects because of server_lifetime
+	 * must be separated.  This avoids the need to re-launch lot
+	 * of connections together.
+	 */
 	if (pool_pool_size(pool) > 0)
 		lifetime_kill_gap = cf_server_lifetime / pool_pool_size(pool);
 
@@ -778,7 +784,7 @@ bool release_server(PgSocket *server)
 
 	/* enforce lifetime immediately on release */
 	if (server->state != SV_LOGIN && life_over(server)) {
-		disconnect_server(server, true, "server_lifetime");
+		disconnect_server(server, true, "server lifetime over");
 		pool->last_lifetime_disconnect = get_cached_time();
 		return false;
 	}
@@ -803,13 +809,16 @@ bool release_server(PgSocket *server)
 	return true;
 }
 
-/* drop server connection */
-void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
+/*
+ * close server connection
+ *
+ * send_term=true means to send a Terminate message to the server
+ * before disconnecting, send_term=false means to disconnect without.
+ * The latter is for protocol and communication errors where a normal
+ * protocol termination is not possible.
+ */
+void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...)
 {
-	PgPool *pool = server->pool;
-	PgSocket *client;
-	static const uint8_t pkt_term[] = {'X', 0,0,0,4};
-	bool send_term = true;
 	usec_t now = get_cached_time();
 	char buf[128];
 	va_list ap;
@@ -824,14 +833,23 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 			  (now - server->connect_time) / USEC);
 
 	switch (server->state) {
-	case SV_ACTIVE:
-		client = server->link;
+	case SV_ACTIVE:	{
+		PgSocket *client = server->link;
+
 		if (client) {
 			client->link = NULL;
 			server->link = NULL;
-			disconnect_client(client, true, "%s", reason);
+			/*
+			 * Send reason to client if it is already
+			 * logged in, otherwise send generic message.
+			 */
+			if (client->state == CL_ACTIVE || client->state == CL_WAITING)
+				disconnect_client(client, true, "%s", reason);
+			else
+				disconnect_client(client, true, "bouncer config error");
 		}
 		break;
+	}
 	case SV_TESTED:
 	case SV_USED:
 	case SV_IDLE:
@@ -843,8 +861,8 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 		 */
 		if (!server->ready)
 		{
-			pool->last_login_failed = true;
-			pool->last_connect_failed = true;
+			server->pool->last_login_failed = true;
+			server->pool->last_connect_failed = true;
 		}
 		else
 		{
@@ -853,7 +871,7 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 			 * cancellation, so to the best of our knowledge we can connect to
 			 * the server, reset last_connect_failed accordingly.
 			 */
-			pool->last_connect_failed = false;
+			server->pool->last_connect_failed = false;
 			send_term = false;
 		}
 		break;
@@ -864,7 +882,8 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 	Assert(server->link == NULL);
 
 	/* notify server and close connection */
-	if (send_term && notify) {
+	if (send_term) {
+		static const uint8_t pkt_term[] = {'X', 0,0,0,4};
 		bool _ignore = sbuf_answer(&server->sbuf, pkt_term, sizeof(pkt_term));
 		(void) _ignore;
 	}
@@ -884,7 +903,14 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 		log_noise("sbuf_close failed, retry later");
 }
 
-/* drop client connection */
+/*
+ * close client connection
+ *
+ * notify=true means to send the reason message as an error to the
+ * client, notify=false means no message is sent.  The latter is for
+ * protocol and communication errors where sending a regular error
+ * message is not possible.
+ */
 void disconnect_client(PgSocket *client, bool notify, const char *reason, ...)
 {
 	usec_t now = get_cached_time();
@@ -954,6 +980,10 @@ void disconnect_client(PgSocket *client, bool notify, const char *reason, ...)
 	if (client->login_user && client->login_user->mock_auth) {
 		free(client->login_user);
 		client->login_user = NULL;
+	}
+	if (client->db && client->db->fake) {
+		free(client->db);
+		client->db = NULL;
 	}
 
 	change_client_state(client, CL_JUSTFREE);
@@ -1029,19 +1059,41 @@ static void dns_connect(struct PgSocket *server)
 	struct sockaddr_in6 sa_in6;
 	struct sockaddr *sa;
 	struct PgDatabase *db = server->pool->db;
-	const char *host = db->host;
-	const char *unix_dir;
+	const char *host;
 	int sa_len;
 	int res;
+	char *host_copy = NULL;
+
+	/* host list? */
+	if (db->host && strchr(db->host, ',')) {
+		int count = 1;
+		int n;
+
+		for (const char *p = db->host; *p; p++)
+			if (*p == ',')
+				count++;
+
+		host_copy = xstrdup(db->host);
+		for (host = strtok(host_copy, ","), n = 0; host; host = strtok(NULL, ","), n++)
+			if (server->pool->rrcounter % count == n)
+				break;
+		Assert(host);
+
+		server->pool->rrcounter++;
+	} else {
+		host = db->host;
+	}
 
 	if (!host || host[0] == '/' || host[0] == '@') {
+		const char *unix_dir;
+
 		memset(&sa_un, 0, sizeof(sa_un));
 		sa_un.sun_family = AF_UNIX;
 		unix_dir = host ? host : cf_unix_socket_dir;
 		if (!unix_dir || !*unix_dir) {
 			log_error("unix socket dir not configured: %s", db->name);
 			disconnect_server(server, false, "cannot connect");
-			return;
+			goto cleanup;
 		}
 		snprintf(sa_un.sun_path, sizeof(sa_un.sun_path),
 			 "%s/.s.PGSQL.%d", unix_dir, db->port);
@@ -1061,18 +1113,18 @@ static void dns_connect(struct PgSocket *server)
 		sa = (struct sockaddr *)&sa_un;
 		res = 1;
 	} else if (strchr(host, ':')) {  /* assume IPv6 address on any : in addr */
-		slog_noise(server, "inet6 socket: %s", db->host);
+		slog_noise(server, "inet6 socket: %s", host);
 		memset(&sa_in6, 0, sizeof(sa_in6));
 		sa_in6.sin6_family = AF_INET6;
-		res = inet_pton(AF_INET6, db->host, &sa_in6.sin6_addr);
+		res = inet_pton(AF_INET6, host, &sa_in6.sin6_addr);
 		sa_in6.sin6_port = htons(db->port);
 		sa = (struct sockaddr *)&sa_in6;
 		sa_len = sizeof(sa_in6);
 	} else { /* else try IPv4 */
-		slog_noise(server, "inet socket: %s", db->host);
+		slog_noise(server, "inet socket: %s", host);
 		memset(&sa_in, 0, sizeof(sa_in));
 		sa_in.sin_family = AF_INET;
-		res = inet_pton(AF_INET, db->host, &sa_in.sin_addr);
+		res = inet_pton(AF_INET, host, &sa_in.sin_addr);
 		sa_in.sin_port = htons(db->port);
 		sa = (struct sockaddr *)&sa_in;
 		sa_len = sizeof(sa_in);
@@ -1081,15 +1133,17 @@ static void dns_connect(struct PgSocket *server)
 	/* if simple parse failed, use DNS */
 	if (res != 1) {
 		struct DNSToken *tk;
-		slog_noise(server, "dns socket: %s", db->host);
+		slog_noise(server, "dns socket: %s", host);
 		/* launch dns lookup */
-		tk = adns_resolve(adns, db->host, dns_callback, server);
+		tk = adns_resolve(adns, host, dns_callback, server);
 		if (tk)
 			server->dns_token = tk;
-		return;
+		goto cleanup;
 	}
 
 	connect_server(server, sa, sa_len);
+cleanup:
+	free(host_copy);
 }
 
 PgSocket *compare_connections_by_time(PgSocket *lhs, PgSocket *rhs)
@@ -1289,6 +1343,18 @@ PgSocket *accept_client(int sock, bool is_unix)
 /* client managed to authenticate, send welcome msg and accept queries */
 bool finish_client_login(PgSocket *client)
 {
+	if (client->db->fake) {
+		if (cf_log_connections)
+			slog_info(client, "login failed: db=%s user=%s", client->db->name, client->login_user->name);
+		disconnect_client(client, true, "no such database: %s", client->db->name);
+		return false;
+	}
+
+	if (client->db->db_disabled) {
+		disconnect_client(client, true, "database \"%s\" is disabled", client->db->name);
+		return false;
+	}
+
 	switch (client->state) {
 	case CL_LOGIN:
 		change_client_state(client, CL_ACTIVE);

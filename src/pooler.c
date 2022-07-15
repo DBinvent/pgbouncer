@@ -67,6 +67,9 @@ static void cleanup_sockets(void)
 
 	while ((el = statlist_pop(&sock_list)) != NULL) {
 		ls = container_of(el, struct ListenSocket, node);
+		if (event_del(&ls->ev) < 0) {
+			log_warning("cleanup_sockets, event_del: %s", strerror(errno));
+		}
 		if (ls->fd > 0) {
 			safe_close(ls->fd);
 			ls->fd = 0;
@@ -245,8 +248,6 @@ static void create_unix_socket(const char *socket_dir, int listen_port)
  * optval specifies how long after connection attempt to wait for data.
  *
  * Related to tcp_synack_retries sysctl, default 5 (corresponds 180 secs).
- *
- * SO_ACCEPTFILTER needs to be set after listen(), maybe TCP_DEFER_ACCEPT too.
  */
 static void tune_accept(int sock, bool on)
 {
@@ -255,25 +256,19 @@ static void tune_accept(int sock, bool on)
 #ifdef TCP_DEFER_ACCEPT
 	int val = 45; /* FIXME: proper value */
 	socklen_t vlen = sizeof(val);
-	res = getsockopt(sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, &val, &vlen);
-	log_noise("old TCP_DEFER_ACCEPT on %d = %d", sock, val);
+	if (getsockopt(sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, &val, &vlen) == 0)
+		log_noise("old TCP_DEFER_ACCEPT on %d = %d", sock, val);
 	val = on ? 1 : 0;
 	log_noise("%s TCP_DEFER_ACCEPT on %d", act, sock);
 	res = setsockopt(sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, &val, sizeof(val));
 #else
-#if 0
-#ifdef SO_ACCEPTFILTER
-	struct accept_filter_arg af, *afp = on ? &af : NULL;
-	socklen_t af_len = on ? sizeof(af) : 0;
-	memset(&af, 0, sizeof(af));
-	strcpy(af.af_name, "dataready");
-	log_noise("%s SO_ACCEPTFILTER on %d", act, sock);
-	res = setsockopt(sock, SOL_SOCKET, SO_ACCEPTFILTER, afp, af_len);
-#endif
-#endif
+	if (on) {
+		errno = EINVAL;
+		res = -1;
+	}
 #endif
 	if (res < 0)
-		log_warning("tune_accept: %s TCP_DEFER_ACCEPT/SO_ACCEPTFILTER: %s",
+		log_warning("tune_accept: %s TCP_DEFER_ACCEPT: %s",
 			    act, strerror(errno));
 }
 
@@ -458,7 +453,6 @@ static bool parse_addr(void *arg, const char *addr)
 	int res;
 	char service[64];
 	struct addrinfo *ai, *gaires = NULL;
-	bool ok;
 
 	if (!*addr)
 		return true;
@@ -473,10 +467,15 @@ static bool parse_addr(void *arg, const char *addr)
 	}
 
 	for (ai = gaires; ai; ai = ai->ai_next) {
-		ok = add_listen(ai->ai_family, ai->ai_addr, ai->ai_addrlen);
-		/* it's unclear whether all or only first result should be used */
-		if (0 && ok)
-			break;
+		/*
+		 * add_listen() will log a warning if there is a
+		 * problem.  We don't use the return value to fail the
+		 * whole thing, because that might lead to problems in
+		 * practice with overlapping host names or address
+		 * families and other weird stuff.  Users will know
+		 * soon enough if they can't connect.
+		 */
+		add_listen(ai->ai_family, ai->ai_addr, ai->ai_addrlen);
 	}
 
 	freeaddrinfo(gaires);

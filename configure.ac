@@ -1,7 +1,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_INIT([PgBouncer],
-        [1.16.1],
+        [1.17.0],
         [https://github.com/pgbouncer/pgbouncer/issues], [],
         [https://www.pgbouncer.org/])
 AC_CONFIG_SRCDIR(src/janitor.c)
@@ -129,12 +129,14 @@ fi
 if test "$use_cares" = "yes"; then
   AC_DEFINE(USE_CARES, 1, [Use c-ares for name resolution.])
 
-  # does it support SOA parse
   tmp_CFLAGS="$CFLAGS"
   tmp_LIBS="$LIBS"
   CFLAGS="$CARES_CFLAGS $CFLAGS"
   LIBS="$CARES_LIBS $LIBS"
+  # does it support SOA parse
   AC_CHECK_FUNCS(ares_parse_soa_reply)
+  # portability substitute for arpa/nameser.h, needed mainly for Windows
+  AC_CHECK_HEADERS([ares_nameser.h])
   LIBS="$tmp_LIBS"
   CFLAGS="$tmp_CFLAGS"
 
@@ -202,6 +204,10 @@ AC_USUAL_TLS
 AC_USUAL_DEBUG
 AC_USUAL_CASSERT
 AC_USUAL_WERROR
+
+PACKAGE_VERSION_4B=`echo "${PACKAGE_VERSION}.0" | sed -e 's/\./,/g'`
+AC_DEFINE_UNQUOTED(PACKAGE_VERSION_4B, [$PACKAGE_VERSION_4B],
+                   [Define to the version of this package for Windows resource file (1,2,3,4).])dnl
 
 dnl Output findings
 AC_CONFIG_FILES([config.mak])

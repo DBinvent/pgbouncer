@@ -193,8 +193,9 @@ Default: 0 (unlimited)
 
 By default, PgBouncer reuses server connections in LIFO (last-in, first-out) manner,
 so that few connections get the most load.  This gives best performance if you have
-a single server serving a database.  But if there is TCP round-robin behind a database
-IP address, then it is better if PgBouncer also uses connections in that manner, thus
+a single server serving a database.  But if there is a round-robin
+system behind a database address (TCP, DNS, or host list), then it is
+better if PgBouncer also uses connections in that manner, thus
 achieving uniform load.
 
 Default: 0
@@ -489,7 +490,8 @@ Default: 0
 
 ### server_lifetime
 
-The pooler will close an unused server connection that has been connected longer
+The pooler will close an unused (not currently linked to any client connection)
+server connection that has been connected longer
 than this. Setting it to 0 means the connection is to be used only once,
 then closed. [seconds]
 
@@ -511,8 +513,20 @@ Default: 15.0
 
 ### server_login_retry
 
-If login failed, because of failure from connect() or authentication, the
-pooler waits this much before retrying to connect. [seconds]
+If login to the server failed, because of failure to connect or from
+authentication, the pooler waits this much before retrying to connect.
+During the waiting interval, new clients trying to connect to the
+failing server will get an error immediately without another
+connection attempt. [seconds]
+
+The purpose of this behavior is that clients don't unnecessarily queue
+up waiting for a server connection to become available if the server
+is not working.  However, it also means that if a server is
+momentarily failing, for example during a restart or if the
+configuration was erroneous, then it will take at least this long
+until the pooler will consider connecting to it again.  Planned events
+such as restarts should normally be managed using the `PAUSE` command
+to avoid this.
 
 Default: 15.0
 
@@ -534,9 +548,8 @@ Default: 3600.0
 
 ### dns_max_ttl
 
-How long DNS lookups can be cached.  If a DNS lookup returns
-several answers, PgBouncer will robin-between them.
-The actual DNS TTL is ignored.  [seconds]
+How long DNS lookups can be cached.  The actual DNS TTL is ignored.
+[seconds]
 
 Default: 15.0
 
@@ -836,9 +849,13 @@ Default: 0
 
 ### tcp_defer_accept
 
-For details on this and other TCP options, please see `man 7 tcp`.
+Sets the `TCP_DEFER_ACCEPT` socket option; see `man 7 tcp` for
+details.  (This is a Boolean option: 1 means enabled.  The actual
+value set if enabled is currently hardcoded to 45 seconds.)
 
-Default: 45 on Linux, otherwise 0
+This is currently only supported on Linux.
+
+Default: 1 on Linux, otherwise 0
 
 ### tcp_socket_buffer
 
@@ -879,10 +896,19 @@ Default: 0
 
 ## Section [databases]
 
-This contains key=value pairs where the key will be taken as a database name and the
-value as a libpq connection string style list of key=value pairs.
-Not all features known from libpq can be used (service=, .pgpass), since the actual
-libpq is not used.
+The section `[databases]` defines the names of the databases that
+clients of PgBouncer can connect to and specifies where those
+connections will be routed.  The section contains key=value lines like
+
+    dbname = connection string
+
+where the key will be taken as a database name and the value as a
+connection string, consisting of key=value pairs of connection
+parameters, described below (similar to libpq, but the actual libpq is
+not used and the set of available features is different).  Example:
+
+    foodb = host=host1.example.com port=5432
+    bardb = host=localhost dbname=bazdb
 
 The database name can contain characters `_0-9A-Za-z` without quoting.
 Names that contain other characters need to be quoted with standard SQL
@@ -922,12 +948,33 @@ at connection time, the result is cached per `dns_max_ttl` parameter.
 When a host name's resolution changes, existing server connections are
 automatically closed when they are released (according to the pooling
 mode), and new server connections immediately use the new resolution.
-If DNS returns several results, they are used in round-robin
+If DNS returns several results, they are used in a round-robin
 manner.
 
 If the value begins with `/`, then a Unix socket in the file-system
 namespace is used.  If the value begins with `@`, then a Unix socket
 in the abstract namespace is used.
+
+A comma-separated list of host names or addresses can be specified.
+In that case, connections are made in a round-robin manner.  (If a
+host list contains host names that in turn resolve via DNS to multiple
+addresses, the round-robin systems operate independently.  This is an
+implementation dependency that is subject to change.)  Note that in a
+list, all hosts must be available at all times: There are no
+mechanisms to skip unreachable hosts or to select only available hosts
+from a list or similar.  (This is different from what a host list in
+libpq means.)  Also note that this only affects how the destinations
+of new connections are chosen.  See also the setting
+`server_round_robin` for how clients are assigned to already
+established server connections.
+
+Examples:
+
+	host=localhost
+	host=127.0.0.1
+	host=2001:0db8:85a3:0000:0000:8a2e:0370:7334
+	host=/var/run/postgresql
+	host=192.168.0.1,192.168.0.2,192.168.0.3
 
 Default: not set, meaning to use a Unix socket
 
@@ -999,10 +1046,17 @@ Ask specific `timezone` from server.
 
 ## Section [users]
 
-This contains key=value pairs where the key will be taken as a user name and
-the value as a libpq connection string style list of key=value pairs of
-configuration settings specific for this user.  Only a few settings
-are available here.
+This section contains key=value lines like
+
+    user1 = settings
+
+where the key will be taken as a user name and the value as a list of
+key=value pairs of configuration settings specific for this user.
+Example:
+
+    user1 = pool_mode=session
+
+Only a few settings are available here.
 
 ### pool_mode
 
@@ -1096,9 +1150,9 @@ The file follows the format of the PostgreSQL `pg_hba.conf` file
   User name map (`map=`) parameter is not supported.
 
 
-## Example
+## Examples
 
-Minimal config:
+Small example configuration:
 
     [databases]
     template1 = host=localhost dbname=template1 auth_user=someuser
@@ -1114,7 +1168,7 @@ Minimal config:
     admin_users = someuser
     stats_users = stat_collector
 
-Database defaults:
+Database examples:
 
     [databases]
 
