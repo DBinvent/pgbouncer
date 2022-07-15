@@ -876,9 +876,10 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 	return true;
 }
 
-char *insert_sub_string(const char *source_str, const char *pattern, const char *new_sub_str) {
+char *insert_sub_string(const char *source_str, const char *pattern,  const char *not_pattern, const char *new_sub_str) {
   char *match = strcasestr(source_str, pattern);
-  if (match != NULL) {
+  char *match_not = strcasestr(source_str, not_pattern);
+  if (match != NULL && match_not == NULL) {
     size_t len = strlen(source_str);
     size_t n1 = match - source_str;
     size_t n2 = strlen(new_sub_str);
@@ -898,7 +899,9 @@ char *insert_sub_string(const char *source_str, const char *pattern, const char 
 const int Q_OFFSET_TO_QUERY_BODY = 5;
 char *const q_pattern1 = "commit";
 char *const q_pattern2 = "rollback";
-char *const new_sub_query = "select prepare_commit();"; //TODO move to config
+char *const q_pattern_n = "prepared";
+char *const new_sub_query_ok = "select yt_complete(true);"; // TODO move 'yt_complete' to config
+char *const new_sub_query_no = "select yt_complete(false);";
 
 /* decide on packets of logged-in client */
 static bool handle_client_work(PgSocket *client, PktHdr *pkt)
@@ -1003,12 +1006,12 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 	if (query_str != NULL) {
 		size_t query_str_len = strlen(query_str);
-		char *new_query_str_tmp = insert_sub_string(query_str, q_pattern1, new_sub_query);
-		char *new_query_str = insert_sub_string(new_query_str_tmp, q_pattern2, new_sub_query);
+		char *new_query_str_tmp = insert_sub_string(query_str, q_pattern1, q_pattern_n, new_sub_query_ok);
+		char *new_query_str = insert_sub_string(new_query_str_tmp, q_pattern2, q_pattern_n, new_sub_query_no);
 		size_t new_query_str_len = strlen(new_query_str);
 
 		if (query_str_len != new_query_str_len) {
-			/*TODO you may need only 1 type of these 2 types of logs*/
+			/*TODO optimize it: you may need only 1 type of these 2 types of logs*/
 			slog_debug(client, "original query: %s", query_str);
 			slog_debug(client, "modified query: %s", new_query_str);
 			log_generic(LG_INFO, NULL, "original query: %s", query_str);
