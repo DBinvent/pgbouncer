@@ -177,7 +177,7 @@ static void per_loop_activate(PgPool *pool)
 	int sv_tested, sv_used;
 
 	/* if there is a cancel request waiting, open a new connection */
-	if (!statlist_empty(&pool->cancel_req_list)) {
+	if (!statlist_empty(&pool->waiting_cancel_req_list)) {
 		launch_new_connection(pool, /* evict_if_needed= */ true);
 		return;
 	}
@@ -402,6 +402,17 @@ static void pool_client_maint(PgPool *pool)
 				disconnect_client(client, true, "query_timeout");
 			} else if (cf_query_wait_timeout > 0 && age > cf_query_wait_timeout) {
 				disconnect_client(client, true, "query_wait_timeout");
+			}
+		}
+		statlist_for_each_safe(item, &pool->waiting_cancel_req_list, tmp) {
+			client = container_of(item, PgSocket, head);
+			Assert(client->state == CL_WAITING_CANCEL);
+			age = now - client->request_time;
+
+			if (cf_query_timeout > 0 && age > cf_query_timeout) {
+				disconnect_client(client, false, "cancel request query_timeout");
+			} else if (cf_query_wait_timeout > 0 && age > cf_query_wait_timeout) {
+				disconnect_client(client, false, "cancel request query_wait_timeout");
 			}
 		}
 	}
@@ -674,9 +685,13 @@ void kill_pool(PgPool *pool)
 
 	close_client_list(&pool->active_client_list, reason);
 	close_client_list(&pool->waiting_client_list, reason);
-	close_client_list(&pool->cancel_req_list, reason);
+
+	close_client_list(&pool->active_cancel_req_list, reason);
+	close_client_list(&pool->waiting_cancel_req_list, reason);
 
 	close_server_list(&pool->active_server_list, reason);
+	close_server_list(&pool->active_cancel_server_list, reason);
+	close_server_list(&pool->wait_cancels_server_list, reason);
 	close_server_list(&pool->idle_server_list, reason);
 	close_server_list(&pool->used_server_list, reason);
 	close_server_list(&pool->tested_server_list, reason);
